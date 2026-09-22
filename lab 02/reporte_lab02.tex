@@ -1,0 +1,177 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\geometry{top=2.5cm, bottom=2.5cm, left=2.5cm, right=2.5cm}
+
+\title{\textbf{Selected Topics in Cryptography}\\ Lab Session 02: Toy ECDH}
+\author{Estudiante}
+\date{\today}
+
+\lstset{
+    language=C,
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{red},
+    showstringspaces=false,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny,
+    breaklines=true
+}
+
+\begin{document}
+
+\maketitle
+
+\section*{1. Personal Information}
+\textbf{Course:} Selected Topics in Cryptography \\
+\textbf{Date:} \today \\
+\textbf{Topic:} Elliptic Curve Cryptography: Point Multiplication and ECDH Simulation.
+
+\section*{2. Source Code}
+The elliptic curve operations have been adapted to use \textbf{Standard Projective Coordinates} $(X, Y, Z)$ to represent affine points $(X/Z, Y/Z)$ avoiding costly modular inversions during addition and doubling operations.
+
+\subsection*{Algorithm 1: Right-to-Left Point Multiplication}
+\begin{lstlisting}
+int elipar_point_mul_r2l(point_t* R, const point_t* P, const mpz_t k, const mpz_t a, const mpz_t b, const mpz_t p, bool print_steps) {
+    point_t res, temp;
+    point_init(&res); point_init(&temp);
+    point_set_infinity(&res);
+    point_set(&temp, P);
+    
+    mpz_t k_copy; mpz_init_set(k_copy, k);
+    size_t i = 0;
+    while (mpz_cmp_ui(k_copy, 0) > 0) {
+        if (mpz_odd_p(k_copy)) {
+            elipar_point_add(&res, &res, &temp, a, b, p);
+        }
+        elipar_point_double(&temp, &temp, a, b, p);
+        mpz_fdiv_q_2exp(k_copy, k_copy, 1);
+        i++;
+    }
+    
+    point_set(R, &res);
+    mpz_clear(k_copy); point_clear(&res); point_clear(&temp);
+    return 0;
+}
+\end{lstlisting}
+
+\subsection*{Algorithm 2: Left-to-Right Point Multiplication}
+\begin{lstlisting}
+int elipar_point_mul_l2r(point_t* R, const point_t* P, const mpz_t k, const mpz_t a, const mpz_t b, const mpz_t p, bool print_steps) {
+    point_t res, temp_p;
+    point_init(&res); point_init(&temp_p);
+    point_set_infinity(&res);
+    point_set(&temp_p, P);
+    
+    mpz_t k_copy; mpz_init_set(k_copy, k);
+    size_t num_bits = mpz_sizeinbase(k_copy, 2);
+    
+    for (long i = num_bits - 1; i >= 0; i--) {
+        elipar_point_double(&res, &res, a, b, p);
+        if (mpz_tstbit(k_copy, i)) {
+            elipar_point_add(&res, &res, &temp_p, a, b, p);
+        }
+    }
+    
+    point_set(R, &res);
+    mpz_clear(k_copy); point_clear(&res); point_clear(&temp_p);
+    return 0;
+}
+\end{lstlisting}
+
+\section*{3. Testing Functions}
+Below are 5 examples using both the Right-to-Left and Left-to-Right algorithms for $kP$. 
+We used the curve $y^2 \equiv x^3 + 2x + 3 \pmod{97}$ with generator point $P = (3, 6)$. 
+Notice that this specific point $P$ generates a subgroup of order 5 ($5P = \mathcal{O}$).
+
+\begin{verbatim}
+--- Test 1: k = 5 ---
+>> Algoritmo R2L:
+  [R2L i=0] k_i=1 -> Q = Q + P_i. Actual Q: (3, 6)
+  [R2L i=1] k_i=0 -> Omitir suma.
+  [R2L i=2] k_i=1 -> Q = Q + P_i. Actual Q: O
+>> Algoritmo L2R:
+  [L2R i=2] Q = 2Q. Actual Q: O
+  [L2R i=2] k_i=1 -> Q = Q + P. Actual Q: (3, 6)
+  [L2R i=1] Q = 2Q. Actual Q: (80, 10)
+  [L2R i=1] k_i=0 -> Omitir suma.
+  [L2R i=0] Q = 2Q. Actual Q: (3, 91)
+  [L2R i=0] k_i=1 -> Q = Q + P. Actual Q: O
+Resultado: O (Punto al infinito)
+
+--- Test 2: k = 10 ---
+>> Algoritmo R2L:
+  [R2L i=0] k_i=0 -> Omitir suma.
+  [R2L i=1] k_i=1 -> Q = Q + P_i. Actual Q: (80, 10)
+  [R2L i=2] k_i=0 -> Omitir suma.
+  [R2L i=3] k_i=1 -> Q = Q + P_i. Actual Q: O
+Resultado: O
+
+--- Test 3: k = 15 ---
+>> Algoritmo R2L:
+  [R2L i=0] k_i=1 -> Q = Q + P_i. Actual Q: (3, 6)
+  [R2L i=1] k_i=1 -> Q = Q + P_i. Actual Q: (80, 87)
+  [R2L i=2] k_i=1 -> Q = Q + P_i. Actual Q: (80, 10)
+  [R2L i=3] k_i=1 -> Q = Q + P_i. Actual Q: O
+Resultado: O
+
+--- Test 4: k = 20 ---
+>> Algoritmo R2L:
+  [R2L i=0] k_i=0 -> Omitir suma.
+  [R2L i=1] k_i=0 -> Omitir suma.
+  [R2L i=2] k_i=1 -> Q = Q + P_i. Actual Q: (3, 91)
+  [R2L i=3] k_i=0 -> Omitir suma.
+  [R2L i=4] k_i=1 -> Q = Q + P_i. Actual Q: O
+Resultado: O
+
+--- Test 5: k = 25 ---
+>> Algoritmo R2L:
+  [R2L i=0] k_i=1 -> Q = Q + P_i. Actual Q: (3, 6)
+  [R2L i=1] k_i=0 -> Omitir suma.
+  [R2L i=2] k_i=0 -> Omitir suma.
+  [R2L i=3] k_i=1 -> Q = Q + P_i. Actual Q: (3, 91)
+  [R2L i=4] k_i=1 -> Q = Q + P_i. Actual Q: O
+Resultado: O
+\end{verbatim}
+
+\section*{4. Simulation of ECDH}
+An automated simulation was created for two entities (Alice and Bob) generating a shared secret $S$. We randomly generated a $128$-bit prime for the underlying finite field.
+
+\begin{verbatim}
+Parametros ECDH acordados:
+p = 259724759763936159802421243210352256999
+a = 192949947194419950194383621095450484007
+b = 74149303083644888237766867364156607885
+G = (5, 7)
+
+Alice elige kA secreta: 224632427021277000312758535088198607810
+Bob elige kB secreta: 100976876835531676369569759916640712836
+
+Alice calcula y comparte A = kA * G:
+  A = (173418783328457929096808771792846765109, 
+       164068629066182190983474325829852729273)
+
+Bob calcula y comparte B = kB * G:
+  B = (50305030179271160272561851324741241275, 
+       46913123138051945780540674811974877892)
+
+Alice calcula el secreto S = kA * B:
+  S = (60968394712849497951362774872976264714, 
+       253273267623164229503681617562391842455)
+
+Bob calcula el secreto S = kB * A:
+  S = (60968394712849497951362774872976264714, 
+       253273267623164229503681617562391842455)
+
+=> ¡Las claves coinciden! El ECDH fue exitoso.
+\end{verbatim}
+
+\end{document}
