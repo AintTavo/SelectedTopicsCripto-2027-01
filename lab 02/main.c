@@ -119,9 +119,38 @@ int main(void) {
                 read_mpz_from_input(p, "Primo p de la curva: ");
                 read_mpz_from_input(a, "Parametro a: ");
                 read_mpz_from_input(b, "Parametro b: ");
-                read_mpz_from_input(n, "Cardinalidad de la curva (n): ");
-                input_point(&G, "Generador G");
-                read_mpz_from_input(d, "Llave Privada (d): ");
+                
+                if (mpz_cmp_ui(p, 200000) <= 0) {
+                    printf("[*] El primo p es pequeño. Calculando la cardinalidad (n) y obteniendo un generador (G) automaticamente...\n");
+                    size_t count = 0;
+                    point_t* pts = elipar_rational_points(a, b, p, &count);
+                    if (pts != NULL && count > 1) {
+                        mpz_set_ui(n, count);
+                        // pts[0] is infinity usually, let's pick the first non-infinity point
+                        size_t g_idx = 1;
+                        for (size_t i = 0; i < count; i++) {
+                            if (!point_is_infinity(&pts[i])) { g_idx = i; break; }
+                        }
+                        point_set(&G, &pts[g_idx]);
+                        
+                        gmp_printf(" => Cardinalidad de la curva (n) calculada: %Zd\n", n);
+                        gmp_printf(" => Punto Generador (G) seleccionado: (%Zd, %Zd)\n", G.x, G.y);
+                        elipar_free_points(pts, count);
+                    } else {
+                        printf("[-] Error calculando puntos. Intente con otra curva.\n");
+                        mpz_clears(p, a, b, n, d, NULL);
+                        point_clear(&G); point_clear(&Q); point_clear(&Q_aff);
+                        break;
+                    }
+                } else {
+                    printf("[!] El primo p es de tamaño criptográfico.\n");
+                    printf("    Calcular la cardinalidad de curvas enormes desde cero requiere el complejo Algoritmo de Schoof.\n");
+                    printf("    Por favor, proporciona los parametros estandar de la curva:\n");
+                    read_mpz_from_input(n, "Cardinalidad de la curva (n): ");
+                    input_point(&G, "Generador G");
+                }
+                
+                read_mpz_from_input(d, "Ingresa tu Llave Privada secreta (d): ");
                 
                 elipar_point_mul_l2r(&Q, &G, d, a, b, p, false);
                 elipar_projective_to_affine(&Q_aff, &Q, p);

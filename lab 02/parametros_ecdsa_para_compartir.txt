@@ -1,0 +1,53 @@
+=======================================================
+   PARAMETROS PUBLICOS Y FIRMA ECDSA (secp256k1)
+=======================================================
+Hola compañero, para la verificación de ECDSA (Opcion 6) 
+en tu programa, ingresa los siguientes valores exactamente 
+como están aquí. Puedes copiar y pegar todo (incluso 
+los que tienen 0x).
+
+--- 1. PARAMETROS ESTANDAR DE LA CURVA ---
+Primo p: 
+0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+
+Parametro a: 
+0
+
+Parametro b: 
+7
+
+Orden n: 
+0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+Generador Gx: 
+0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+
+Generador Gy: 
+0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+
+
+--- 2. MI CLAVE PUBLICA (Q) ---
+(Esta es la clave generada a partir de mi secreto d)
+
+Clave Publica Qx: 
+29698218847103947367216533059404903092205696107490020598828859934299628206014
+
+Clave Publica Qy: 
+52816515347318051336084889568293299763077276551404394374036132461554954108517
+
+
+--- 3. MENSAJE Y FIRMA DIGITAL ---
+El mensaje original fue: "Prueba ECDSA"
+
+Hash del mensaje e: 
+24897172716232303187364959041
+
+Firma r: 
+38310812849988110930239595592990453045818571887846438286723620825569415409999
+
+Firma s: 
+7483751238445291322827214063888283125435402404186159523360831641352411389017
+
+=======================================================
+RESULTADO: El programa debe indicar "Firma VÁLIDA"
+=======================================================
