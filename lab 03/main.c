@@ -94,7 +94,7 @@ static int choose_or_input_curve(mpz_t p, mpz_t a, mpz_t b, mpz_t q, point_t* G)
         read_mpz_from_input(a, "Parametro a: ");
         read_mpz_from_input(b, "Parametro b: ");
 
-        if (mpz_cmp_ui(p, 200000) <= 0) {
+        if (mpz_cmp_ui(p, 200) <= 0) {
             printf("[*] El primo p es pequeño (<= 200,000). Calculando cardinalidad automaticamente...\n");
             size_t count = 0;
             point_t* pts = elipar_rational_points(a, b, p, &count);
