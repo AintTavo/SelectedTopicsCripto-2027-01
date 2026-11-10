@@ -1,0 +1,4 @@
+INSTITUTO POLITECNICO NACIONAL - ESCOM
+Selected Topics in Cryptography - Lab 06: CTR and RSA-OAEP
+Documento confidencial transmitido de Bob (Party U) a Alice (Party V)
+mediante transporte de llave KTS-OAEP (NIST SP 800-56B Rev. 2) y AES-128-CTR.

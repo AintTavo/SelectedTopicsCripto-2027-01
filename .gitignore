@@ -1,0 +1,4 @@
+build/
+.agents
+__cmake_systeminformation
+skills/

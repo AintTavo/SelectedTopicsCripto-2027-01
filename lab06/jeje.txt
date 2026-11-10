@@ -1,0 +1,1053 @@
+#ifdef _WIN32
+#  define __USE_MINGW_ANSI_STDIO 1   
+#else
+#  define _XOPEN_SOURCE 700          
+#endif
+
+#include <ctype.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <openssl/bn.h>
+#include <openssl/core_names.h>
+#include <openssl/crypto.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pkcs7.h>
+#include <openssl/rand.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
+
+#ifdef _WIN32
+#  include <io.h>
+typedef __int64 file_off_t;
+#  define FSEEK            _fseeki64
+#  define FTELL            _ftelli64
+#  define OPEN_WRITE(p, m) _open((p), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, \
+                                 _S_IREAD | _S_IWRITE)
+#  define FDOPEN           _fdopen
+#  define FCHMOD(fd, m)    0     
+#  define FILE_EXISTS(p)   (_access((p), 0) == 0)
+#else
+#  include <unistd.h>
+typedef off_t file_off_t;
+#  define FSEEK            fseeko
+#  define FTELL            ftello
+#  define OPEN_WRITE(p, m) open((p), O_WRONLY | O_CREAT | O_TRUNC, (m))
+#  define FDOPEN           fdopen
+#  define FCHMOD(fd, m)    fchmod((fd), (m))
+#  define FILE_EXISTS(p)   (access((p), F_OK) == 0)
+#endif
+
+#define RSA_MODULUS_BITS 3072
+
+#define AES_KEY_BYTES    16
+#define IO_CHUNK         65536
+#define B64_LINE_WIDTH   64
+#define PATH_BUF_SIZE    4096
+#define KEYFILE_MAX_SIZE (1024 * 1024)   
+
+static void ossl_error(const char *msg)
+{
+    fprintf(stderr, "Error: %s\n", msg);
+    ERR_print_errors_fp(stderr);
+}
+
+static void secure_free(void *p, size_t len)
+{
+    if (p != NULL) {
+        OPENSSL_cleanse(p, len);
+        free(p);
+    }
+}
+
+static int b64_encode(const unsigned char *in, size_t inlen,
+                      char **out, size_t *outlen)
+{
+    size_t need = 4 * ((inlen + 2) / 3);
+    char *buf;
+    int n;
+
+    if (inlen > (size_t)INT_MAX / 2)
+        return 0;
+    buf = malloc(need + 1);
+    if (buf == NULL)
+        return 0;
+    n = EVP_EncodeBlock((unsigned char *)buf, in, (int)inlen);
+    if (n < 0 || (size_t)n != need) {
+        free(buf);
+        return 0;
+    }
+    *out = buf;
+    *outlen = need;
+    return 1;
+}
+
+static int b64_decode(const char *in, size_t inlen,
+                      unsigned char **out, size_t *outlen)
+{
+    char *clean;
+    unsigned char *buf;
+    size_t i, n = 0, pad = 0;
+    int r;
+
+    if (inlen > (size_t)INT_MAX)
+        return 0;
+    clean = malloc(inlen + 1);
+    if (clean == NULL)
+        return 0;
+    for (i = 0; i < inlen; i++)
+        if (!isspace((unsigned char)in[i]))
+            clean[n++] = in[i];
+    clean[n] = '\0';
+
+    if (n == 0 || n % 4 != 0) {
+        free(clean);
+        return 0;
+    }
+    if (clean[n - 1] == '=')
+        pad++;
+    if (n > 1 && clean[n - 2] == '=')
+        pad++;
+
+    buf = malloc(n / 4 * 3 + 1);
+    if (buf == NULL) {
+        free(clean);
+        return 0;
+    }
+    r = EVP_DecodeBlock(buf, (const unsigned char *)clean, (int)n);
+    free(clean);
+    if (r < 0 || (size_t)r < pad) {
+        secure_free(buf, n / 4 * 3 + 1);
+        return 0;
+    }
+    *out = buf;
+    *outlen = (size_t)r - pad;
+    return 1;
+}
+
+static int read_file(const char *path, size_t max,
+                     unsigned char **buf, size_t *len)
+{
+    FILE *f = fopen(path, "rb");
+    unsigned char *b, *tmp;
+    size_t cap = 4096, n = 0, r;
+
+    if (f == NULL) {
+        perror(path);
+        return 0;
+    }
+    b = malloc(cap + 1);
+    if (b == NULL) {
+        fclose(f);
+        return 0;
+    }
+    for (;;) {
+        if (n == cap) {
+            if (cap >= max) {
+                fprintf(stderr, "%s: archivo demasiado grande\n", path);
+                secure_free(b, cap + 1);
+                fclose(f);
+                return 0;
+            }
+            tmp = realloc(b, cap * 2 + 1);
+            if (tmp == NULL) {
+                secure_free(b, cap + 1);
+                fclose(f);
+                return 0;
+            }
+            b = tmp;
+            cap *= 2;
+        }
+        r = fread(b + n, 1, cap - n, f);
+        if (r == 0)
+            break;
+        n += r;
+    }
+    if (ferror(f)) {
+        fprintf(stderr, "%s: error de lectura\n", path);
+        secure_free(b, cap + 1);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    b[n] = '\0';
+    *buf = b;
+    *len = n;
+    return 1;
+}
+
+static int write_b64_file(const char *path, const unsigned char *data,
+                          size_t len, mode_t mode)
+{
+    char *b64 = NULL;
+    size_t blen = 0, i, chunk;
+    int fd, ok = 0;
+    FILE *f;
+
+    if (!b64_encode(data, len, &b64, &blen)) {
+        fprintf(stderr, "Error al codificar en base64\n");
+        return 0;
+    }
+    (void)mode;
+    fd = OPEN_WRITE(path, mode);
+    if (fd < 0) {
+        perror(path);
+        goto end;
+    }
+    if (FCHMOD(fd, mode) != 0) {
+        perror("chmod");
+        close(fd);
+        goto end;
+    }
+    f = FDOPEN(fd, "wb");
+    if (f == NULL) {
+        perror("fdopen");
+        close(fd);
+        goto end;
+    }
+    for (i = 0; i < blen; i += B64_LINE_WIDTH) {
+        chunk = blen - i < B64_LINE_WIDTH ? blen - i : B64_LINE_WIDTH;
+        if (fwrite(b64 + i, 1, chunk, f) != chunk || fputc('\n', f) == EOF) {
+            perror(path);
+            fclose(f);
+            goto end;
+        }
+    }
+    if (fclose(f) != 0) {
+        perror(path);
+        goto end;
+    }
+    ok = 1;
+end:
+    secure_free(b64, blen + 1);
+    return ok;
+}
+
+static int read_b64_file(const char *path, size_t max,
+                         unsigned char **out, size_t *outlen)
+{
+    unsigned char *txt = NULL;
+    size_t tlen = 0;
+    int ok;
+
+    if (!read_file(path, max, &txt, &tlen))
+        return 0;
+    ok = b64_decode((const char *)txt, tlen, out, outlen);
+    if (!ok)
+        fprintf(stderr, "%s: contenido base64 no válido\n", path);
+    secure_free(txt, tlen + 1);
+    return ok;
+}
+
+/* Envoltura PKCS #7 (Data) para llaves */
+static int wrap_pkcs7_data(const unsigned char *der, size_t der_len,
+                           unsigned char **p7_der, size_t *p7_len)
+{
+    PKCS7 *p7 = PKCS7_new();
+    int len;
+    if (p7 == NULL)
+        return 0;
+    if (!PKCS7_set_type(p7, NID_pkcs7_data)) {
+        PKCS7_free(p7);
+        return 0;
+    }
+    if (!ASN1_OCTET_STRING_set(p7->d.data, der, (int)der_len)) {
+        PKCS7_free(p7);
+        return 0;
+    }
+    len = i2d_PKCS7(p7, p7_der);
+    PKCS7_free(p7);
+    if (len <= 0)
+        return 0;
+    *p7_len = (size_t)len;
+    return 1;
+}
+
+/* Desenvolver PKCS #7 (Data) si está presente, o usar datos directos */
+static unsigned char *unwrap_pkcs7_data_if_present(const unsigned char *in, size_t inlen,
+                                                   size_t *outlen)
+{
+    const unsigned char *p = in;
+    PKCS7 *p7 = d2i_PKCS7(NULL, &p, (long)inlen);
+    if (p7 != NULL) {
+        if (OBJ_obj2nid(p7->type) == NID_pkcs7_data && p7->d.data != NULL) {
+            size_t len = (size_t)p7->d.data->length;
+            unsigned char *copy = malloc(len + 1);
+            if (copy != NULL) {
+                memcpy(copy, p7->d.data->data, len);
+                copy[len] = '\0';
+                *outlen = len;
+                PKCS7_free(p7);
+                return copy;
+            }
+        }
+        PKCS7_free(p7);
+    }
+    ERR_clear_error();
+    /* Si no es PKCS#7, retornar copia directa de in (compatibilidad PKCS#1 / PKIX) */
+    unsigned char *copy = malloc(inlen + 1);
+    if (copy != NULL) {
+        memcpy(copy, in, inlen);
+        copy[inlen] = '\0';
+        *outlen = inlen;
+    }
+    return copy;
+}
+
+static int crt_inspect(EVP_PKEY *pkey, int print)
+{
+    BIGNUM *n = NULL, *e = NULL, *d = NULL, *p = NULL, *q = NULL;
+    BIGNUM *dp = NULL, *dq = NULL, *qinv = NULL;
+    BIGNUM *t = BN_new(), *m1 = BN_new();
+    BN_CTX *bc = BN_CTX_new();
+    int ok = 0;
+
+    if (t == NULL || m1 == NULL || bc == NULL)
+        goto end;
+
+    if (!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_N, &n)
+        || !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_E, &e)
+        || !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_D, &d)
+        || !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR1, &p)
+        || !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR2, &q)
+        || !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT1, &dp)
+        || !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT2, &dq)
+        || !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_COEFFICIENT1, &qinv)) {
+        fprintf(stderr, "La llave privada no está en formato CRT "
+                        "(faltan p, q, dP, dQ o qInv)\n");
+        ERR_clear_error();
+        goto end;
+    }
+
+    if (!BN_mul(t, p, q, bc) || BN_cmp(t, n) != 0) {
+        fprintf(stderr, "CRT: n != p*q\n");
+        goto end;
+    }
+    
+    if (!BN_sub(m1, p, BN_value_one()) || !BN_mod(t, d, m1, bc)
+        || BN_cmp(t, dp) != 0) {
+        fprintf(stderr, "CRT: dP != d mod (p-1)\n");
+        goto end;
+    }
+    
+    if (!BN_sub(m1, q, BN_value_one()) || !BN_mod(t, d, m1, bc)
+        || BN_cmp(t, dq) != 0) {
+        fprintf(stderr, "CRT: dQ != d mod (q-1)\n");
+        goto end;
+    }
+    
+    if (!BN_mod_mul(t, qinv, q, p, bc) || !BN_is_one(t)) {
+        fprintf(stderr, "CRT: qInv * q != 1 mod p\n");
+        goto end;
+    }
+    ok = 1;
+
+    if (print) {
+        printf("Llave privada en formato CRT (8 valores verificados según NIST SP 800-56BR2):\n");
+        printf("  n    : %4d bits\n", BN_num_bits(n));
+        printf("  e    : %4d bits\n", BN_num_bits(e));
+        printf("  d    : %4d bits\n", BN_num_bits(d));
+        printf("  p    : %4d bits\n", BN_num_bits(p));
+        printf("  q    : %4d bits\n", BN_num_bits(q));
+        printf("  dP   : %4d bits  (d mod (p-1))\n", BN_num_bits(dp));
+        printf("  dQ   : %4d bits  (d mod (q-1))\n", BN_num_bits(dq));
+        printf("  qInv : %4d bits  (q^-1 mod p)\n", BN_num_bits(qinv));
+    }
+end:
+    BN_free(n);  BN_free(e);  BN_free(p);  BN_free(q);
+    BN_clear_free(d);  BN_clear_free(dp);  BN_clear_free(dq);
+    BN_clear_free(qinv);
+    BN_clear_free(t);  BN_clear_free(m1);
+    BN_CTX_free(bc);
+    return ok;
+}
+
+static int generate_keypair(const char *pub_path, const char *priv_path)
+{
+    EVP_PKEY_CTX *ctx = NULL;
+    EVP_PKEY *pkey = NULL;
+    BIGNUM *e = NULL;
+    unsigned char *priv_der = NULL, *pub_der = NULL;
+    unsigned char *priv_p7 = NULL, *pub_p7 = NULL;
+    int priv_len = 0, pub_len = 0;
+    size_t priv_p7_len = 0, pub_p7_len = 0;
+    int ok = 0;
+
+    ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    e = BN_new();
+    if (ctx == NULL || e == NULL || !BN_set_word(e, RSA_F4)) {   
+        ossl_error("no se pudo inicializar la generación de llaves");
+        goto end;
+    }
+    if (EVP_PKEY_keygen_init(ctx) <= 0
+        || EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, RSA_MODULUS_BITS) <= 0
+        || EVP_PKEY_CTX_set1_rsa_keygen_pubexp(ctx, e) <= 0) {
+        ossl_error("parámetros de generación no válidos");
+        goto end;
+    }
+    printf("Generando llave RSA de %d bits (puede tardar unos segundos)...\n",
+           RSA_MODULUS_BITS);
+    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) {
+        ossl_error("falló la generación de la llave");
+        goto end;
+    }
+    if (!crt_inspect(pkey, 1))
+        goto end;
+
+    priv_len = i2d_PrivateKey(pkey, &priv_der);
+    pub_len = i2d_PUBKEY(pkey, &pub_der);
+    if (priv_len <= 0 || pub_len <= 0) {
+        ossl_error("no se pudo serializar la llave");
+        goto end;
+    }
+
+    /* Envolver llaves en PKCS #7 (Data) */
+    if (!wrap_pkcs7_data(priv_der, (size_t)priv_len, &priv_p7, &priv_p7_len)
+        || !wrap_pkcs7_data(pub_der, (size_t)pub_len, &pub_p7, &pub_p7_len)) {
+        ossl_error("no se pudo generar el contenedor PKCS #7 para las llaves");
+        goto end;
+    }
+
+    if (!write_b64_file(priv_path, priv_p7, priv_p7_len, 0600)
+        || !write_b64_file(pub_path, pub_p7, pub_p7_len, 0644))
+        goto end;
+
+    printf("Llave privada (PKCS #7 en base64, permisos 600): %s\n", priv_path);
+    printf("Llave pública (PKCS #7 en base64):               %s\n", pub_path);
+    ok = 1;
+end:
+    if (priv_der != NULL)
+        OPENSSL_clear_free(priv_der, (size_t)priv_len);
+    OPENSSL_free(pub_der);
+    OPENSSL_free(priv_p7);
+    OPENSSL_free(pub_p7);
+    BN_free(e);
+    EVP_PKEY_free(pkey);
+    EVP_PKEY_CTX_free(ctx);
+    return ok;
+}
+
+static EVP_PKEY *load_public_key(const char *path)
+{
+    unsigned char *raw = NULL, *unwrapped = NULL;
+    const unsigned char *p;
+    size_t raw_len = 0, unwrapped_len = 0;
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+
+    if (!read_b64_file(path, KEYFILE_MAX_SIZE, &raw, &raw_len))
+        return NULL;
+
+    unwrapped = unwrap_pkcs7_data_if_present(raw, raw_len, &unwrapped_len);
+    secure_free(raw, raw_len);
+    if (unwrapped == NULL)
+        return NULL;
+
+    p = unwrapped;
+    pkey = d2i_PUBKEY(NULL, &p, (long)unwrapped_len);
+    secure_free(unwrapped, unwrapped_len);
+    if (pkey == NULL) {
+        ossl_error("no se pudo interpretar la llave pública");
+        return NULL;
+    }
+    if (!EVP_PKEY_is_a(pkey, "RSA")) {
+        fprintf(stderr, "La llave no es RSA\n");
+        goto fail;
+    }
+    if (EVP_PKEY_get_bits(pkey) < 2048) {
+        fprintf(stderr, "Módulo demasiado corto (< 2048 bits)\n");
+        goto fail;
+    }
+    ctx = EVP_PKEY_CTX_new(pkey, NULL);
+    if (ctx == NULL || EVP_PKEY_public_check(ctx) <= 0) {
+        ossl_error("la llave pública no es válida");
+        EVP_PKEY_CTX_free(ctx);
+        goto fail;
+    }
+    EVP_PKEY_CTX_free(ctx);
+    return pkey;
+fail:
+    EVP_PKEY_free(pkey);
+    return NULL;
+}
+
+static EVP_PKEY *load_private_key(const char *path)
+{
+    unsigned char *raw = NULL, *unwrapped = NULL;
+    const unsigned char *p;
+    size_t raw_len = 0, unwrapped_len = 0;
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+
+    if (!read_b64_file(path, KEYFILE_MAX_SIZE, &raw, &raw_len))
+        return NULL;
+
+    unwrapped = unwrap_pkcs7_data_if_present(raw, raw_len, &unwrapped_len);
+    secure_free(raw, raw_len);
+    if (unwrapped == NULL)
+        return NULL;
+
+    p = unwrapped;
+    pkey = d2i_AutoPrivateKey(NULL, &p, (long)unwrapped_len);
+    secure_free(unwrapped, unwrapped_len);
+    if (pkey == NULL) {
+        ossl_error("no se pudo interpretar la llave privada");
+        return NULL;
+    }
+    if (!EVP_PKEY_is_a(pkey, "RSA")) {
+        fprintf(stderr, "La llave no es RSA\n");
+        goto fail;
+    }
+    if (EVP_PKEY_get_bits(pkey) < 2048) {
+        fprintf(stderr, "Módulo demasiado corto (< 2048 bits)\n");
+        goto fail;
+    }
+    ctx = EVP_PKEY_CTX_new(pkey, NULL);
+    if (ctx == NULL || EVP_PKEY_check(ctx) <= 0) {
+        ossl_error("la llave privada no es válida");
+        EVP_PKEY_CTX_free(ctx);
+        goto fail;
+    }
+    EVP_PKEY_CTX_free(ctx);
+    if (!crt_inspect(pkey, 1))      
+        goto fail;
+    return pkey;
+fail:
+    EVP_PKEY_free(pkey);
+    return NULL;
+}
+
+static int set_oaep_params(EVP_PKEY_CTX *ctx)
+{
+    return EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) > 0
+        && EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) > 0
+        && EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) > 0;
+}
+
+/* Cifrado de K con RSA-OAEP (Sección 2.3 del PDF) */
+static int wrap_key(EVP_PKEY *pub, const unsigned char *K, size_t klen,
+                    unsigned char **ct, size_t *ctlen)
+{
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pub, NULL);
+    unsigned char *buf = NULL;
+    size_t outlen = 0;
+    int ok = 0;
+
+    if (ctx == NULL || EVP_PKEY_encrypt_init(ctx) <= 0 || !set_oaep_params(ctx)
+        || EVP_PKEY_encrypt(ctx, NULL, &outlen, K, klen) <= 0) {
+        ossl_error("falló la inicialización de RSA-OAEP");
+        goto end;
+    }
+    buf = malloc(outlen);
+    if (buf == NULL)
+        goto end;
+    if (EVP_PKEY_encrypt(ctx, buf, &outlen, K, klen) <= 0) {
+        ossl_error("falló el cifrado RSA-OAEP");
+        goto end;
+    }
+    *ct = buf;
+    *ctlen = outlen;
+    buf = NULL;
+    ok = 1;
+end:
+    free(buf);
+    EVP_PKEY_CTX_free(ctx);
+    return ok;
+}
+
+/* Descifrado de K con RSA-OAEP CRT (Sección 2.4 del PDF) */
+static int unwrap_key(EVP_PKEY *priv, const unsigned char *ct, size_t ctlen,
+                      unsigned char K[AES_KEY_BYTES])
+{
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(priv, NULL);
+    unsigned char *tmp = NULL;
+    size_t outlen = 0;
+    int ok = 0;
+
+    if (ctx == NULL || EVP_PKEY_decrypt_init(ctx) <= 0 || !set_oaep_params(ctx)
+        || EVP_PKEY_decrypt(ctx, NULL, &outlen, ct, ctlen) <= 0) {
+        ossl_error("falló la inicialización de RSA-OAEP");
+        goto end;
+    }
+    tmp = malloc(outlen);
+    if (tmp == NULL)
+        goto end;
+    if (EVP_PKEY_decrypt(ctx, tmp, &outlen, ct, ctlen) <= 0) {
+        ossl_error("falló el descifrado RSA-OAEP "
+                   "(llave incorrecta o texto cifrado alterado)");
+        goto end;
+    }
+    if (outlen != AES_KEY_BYTES) {
+        fprintf(stderr, "La llave recuperada mide %zu bytes, se esperaban %d\n",
+                outlen, AES_KEY_BYTES);
+        goto end;
+    }
+    memcpy(K, tmp, AES_KEY_BYTES);
+    ok = 1;
+end:
+    secure_free(tmp, outlen);
+    EVP_PKEY_CTX_free(ctx);
+    return ok;
+}
+
+/* Cifrado AES directo (sin modo de operación, bloque por bloque con relleno PKCS #7) */
+static int aes_encrypt_file(const char *in_path, const char *out_path,
+                            const unsigned char K[AES_KEY_BYTES])
+{
+    FILE *in = NULL, *out = NULL;
+    EVP_CIPHER_CTX *ctx = NULL;
+    unsigned char *ibuf = NULL, *obuf = NULL;
+    int olen, ok = 0;
+    size_t r, total_in = 0, total_out = 0;
+
+    in = fopen(in_path, "rb");
+    if (in == NULL) {
+        perror(in_path);
+        goto end;
+    }
+    out = fopen(out_path, "wb");
+    if (out == NULL) {
+        perror(out_path);
+        goto end;
+    }
+    ibuf = malloc(IO_CHUNK);
+    obuf = malloc(IO_CHUNK + EVP_MAX_BLOCK_LENGTH);
+    ctx = EVP_CIPHER_CTX_new();
+    if (ibuf == NULL || obuf == NULL || ctx == NULL) {
+        ossl_error("falló asignación de memoria");
+        goto end;
+    }
+
+    /* AES-128 directo (ECB: sin vector de inicialización, con relleno PKCS #7) */
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, K, NULL) != 1
+        || EVP_CIPHER_CTX_set_padding(ctx, 1) != 1) {
+        ossl_error("no se pudo inicializar AES-128 directo");
+        goto end;
+    }
+
+    while ((r = fread(ibuf, 1, IO_CHUNK, in)) > 0) {
+        if (EVP_EncryptUpdate(ctx, obuf, &olen, ibuf, (int)r) != 1) {
+            ossl_error("falló el cifrado");
+            goto end;
+        }
+        if (olen > 0 && fwrite(obuf, 1, (size_t)olen, out) != (size_t)olen) {
+            perror(out_path);
+            goto end;
+        }
+        total_in += r;
+        total_out += (size_t)olen;
+    }
+    if (ferror(in)) {
+        perror(in_path);
+        goto end;
+    }
+    if (EVP_EncryptFinal_ex(ctx, obuf, &olen) != 1) {
+        ossl_error("no se pudo finalizar el cifrado");
+        goto end;
+    }
+    if (olen > 0 && fwrite(obuf, 1, (size_t)olen, out) != (size_t)olen) {
+        perror(out_path);
+        goto end;
+    }
+    total_out += (size_t)olen;
+    ok = 1;
+    printf("Cifrado completado con éxito (AES directo con padding PKCS #7):\n");
+    printf("  Entrada : %zu bytes\n", total_in);
+    printf("  Salida  : %zu bytes (%zu bloques de 16 bytes)\n", total_out, total_out / 16);
+end:
+    if (in != NULL)
+        fclose(in);
+    if (out != NULL && fclose(out) != 0) {
+        perror(out_path);
+        ok = 0;
+    }
+    if (!ok && out != NULL)
+        remove(out_path);
+    secure_free(ibuf, IO_CHUNK);
+    secure_free(obuf, IO_CHUNK + EVP_MAX_BLOCK_LENGTH);
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
+}
+
+/* Descifrado AES directo (sin modo de operación, desrelleno PKCS #7) */
+static int aes_decrypt_file(const char *in_path, const char *out_path,
+                            const unsigned char K[AES_KEY_BYTES])
+{
+    FILE *in = NULL, *out = NULL;
+    EVP_CIPHER_CTX *ctx = NULL;
+    unsigned char *ibuf = NULL, *obuf = NULL;
+    int olen, ok = 0;
+    size_t r, total_out = 0;
+
+    in = fopen(in_path, "rb");
+    if (in == NULL) {
+        perror(in_path);
+        goto end;
+    }
+    out = fopen(out_path, "wb");
+    if (out == NULL) {
+        perror(out_path);
+        goto end;
+    }
+    ibuf = malloc(IO_CHUNK);
+    obuf = malloc(IO_CHUNK + EVP_MAX_BLOCK_LENGTH);
+    ctx = EVP_CIPHER_CTX_new();
+    if (ibuf == NULL || obuf == NULL || ctx == NULL) {
+        ossl_error("falló asignación de memoria");
+        goto end;
+    }
+
+    /* AES-128 directo (ECB: sin vector de inicialización, con relleno PKCS #7) */
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, K, NULL) != 1
+        || EVP_CIPHER_CTX_set_padding(ctx, 1) != 1) {
+        ossl_error("no se pudo inicializar AES-128 directo");
+        goto end;
+    }
+
+    while ((r = fread(ibuf, 1, IO_CHUNK, in)) > 0) {
+        if (EVP_DecryptUpdate(ctx, obuf, &olen, ibuf, (int)r) != 1) {
+            ossl_error("falló el descifrado");
+            goto end;
+        }
+        if (olen > 0 && fwrite(obuf, 1, (size_t)olen, out) != (size_t)olen) {
+            perror(out_path);
+            goto end;
+        }
+        total_out += (size_t)olen;
+    }
+    if (ferror(in)) {
+        perror(in_path);
+        goto end;
+    }
+    if (EVP_DecryptFinal_ex(ctx, obuf, &olen) != 1) {
+        fprintf(stderr, "Error al descifrar: llave AES incorrecta o relleno PKCS #7 dañado.\n");
+        ERR_clear_error();
+        goto end;
+    }
+    if (olen > 0 && fwrite(obuf, 1, (size_t)olen, out) != (size_t)olen) {
+        perror(out_path);
+        goto end;
+    }
+    total_out += (size_t)olen;
+    ok = 1;
+    printf("Descifrado completado con éxito:\n");
+    printf("  Tamaño descifrado: %zu bytes\n", total_out);
+end:
+    if (in != NULL)
+        fclose(in);
+    if (out != NULL && fclose(out) != 0) {
+        perror(out_path);
+        ok = 0;
+    }
+    if (!ok && out != NULL)
+        remove(out_path);
+    secure_free(ibuf, IO_CHUNK);
+    secure_free(obuf, IO_CHUNK + EVP_MAX_BLOCK_LENGTH);
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
+}
+
+static int read_line(const char *msg, char *buf, size_t sz)
+{
+    size_t l;
+    int c;
+
+    printf("%s", msg);
+    fflush(stdout);
+    if (fgets(buf, (int)sz, stdin) == NULL)
+        return -1;
+    l = strcspn(buf, "\r\n");
+    if (buf[l] == '\0' && l == sz - 1) {
+        while ((c = getchar()) != '\n' && c != EOF)
+            ;
+        fprintf(stderr, "Entrada demasiado larga\n");
+        return 0;
+    }
+    buf[l] = '\0';
+    return l > 0;
+}
+
+static int ask_input_path(const char *msg, char *buf, size_t sz)
+{
+    if (read_line(msg, buf, sz) != 1) {
+        fprintf(stderr, "Se requiere un nombre de archivo\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int ask_output_path(const char *msg, char *buf, size_t sz)
+{
+    char ans[16];
+
+    if (!ask_input_path(msg, buf, sz))
+        return 0;
+    if (FILE_EXISTS(buf)) {
+        printf("'%s' ya existe. ¿Sobrescribir? [s/N]: ", buf);
+        fflush(stdout);
+        if (fgets(ans, sizeof(ans), stdin) == NULL
+            || (ans[0] != 's' && ans[0] != 'S' && ans[0] != 'y' && ans[0] != 'Y')) {
+            printf("Operación cancelada.\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void print_key_b64(const char *label, const unsigned char *K)
+{
+    char *b64 = NULL;
+    size_t blen = 0;
+
+    if (b64_encode(K, AES_KEY_BYTES, &b64, &blen)) {
+        printf("%s (base64): %s\n", label, b64);
+        secure_free(b64, blen + 1);
+    }
+}
+
+typedef struct {
+    unsigned char K[AES_KEY_BYTES];
+    int have_K;
+} session_t;
+
+static int get_session_or_input_key(session_t *s, unsigned char K[AES_KEY_BYTES])
+{
+    char ans[16];
+    char line[PATH_BUF_SIZE];
+    unsigned char *decoded = NULL;
+    size_t dlen = 0;
+
+    if (s->have_K) {
+        printf("¿Usar la llave K de la sesión actual? [S/n]: ");
+        fflush(stdout);
+        if (fgets(ans, sizeof(ans), stdin) != NULL
+            && (ans[0] == '\n' || ans[0] == 's' || ans[0] == 'S' || ans[0] == 'y' || ans[0] == 'Y')) {
+            memcpy(K, s->K, AES_KEY_BYTES);
+            return 1;
+        }
+    }
+    if (!read_line("Ingrese la llave K en Base64 (o ruta de archivo que la contiene): ",
+                   line, sizeof(line)) || strlen(line) == 0) {
+        fprintf(stderr, "Se requiere una llave\n");
+        return 0;
+    }
+    if (FILE_EXISTS(line)) {
+        if (!read_b64_file(line, 1024, &decoded, &dlen))
+            return 0;
+    } else {
+        if (!b64_decode(line, strlen(line), &decoded, &dlen)) {
+            fprintf(stderr, "Llave Base64 no válida\n");
+            return 0;
+        }
+    }
+    if (dlen != AES_KEY_BYTES) {
+        fprintf(stderr, "La llave mide %zu bytes, se esperaban %d bytes (128 bits)\n",
+                dlen, AES_KEY_BYTES);
+        secure_free(decoded, dlen);
+        return 0;
+    }
+    memcpy(K, decoded, AES_KEY_BYTES);
+    secure_free(decoded, dlen);
+    return 1;
+}
+
+static void action_keygen(void)
+{
+    char pub[PATH_BUF_SIZE], priv[PATH_BUF_SIZE];
+
+    if (!ask_output_path("Archivo para la llave pública (PKCS #7) : ", pub, sizeof(pub))
+        || !ask_output_path("Archivo para la llave privada (PKCS #7): ", priv, sizeof(priv)))
+        return;
+    if (strcmp(pub, priv) == 0) {
+        fprintf(stderr, "La llave pública y la privada deben ir en archivos distintos\n");
+        return;
+    }
+    if (!generate_keypair(pub, priv))
+        fprintf(stderr, "No se pudo generar el par de llaves\n");
+}
+
+/* Sección 2.2: Generar llave aleatoria K de 128 bits para AES */
+static void action_generate_aes_key(session_t *s)
+{
+    char ans[16];
+    char path[PATH_BUF_SIZE];
+
+    if (RAND_bytes(s->K, AES_KEY_BYTES) != 1) {
+        ossl_error("no se pudo generar la llave aleatoria");
+        return;
+    }
+    s->have_K = 1;
+    print_key_b64("Llave K generada (128 bits)", s->K);
+
+    printf("¿Desea guardar la llave K en un archivo de texto? [s/N]: ");
+    fflush(stdout);
+    if (fgets(ans, sizeof(ans), stdin) != NULL
+        && (ans[0] == 's' || ans[0] == 'S' || ans[0] == 'y' || ans[0] == 'Y')) {
+        if (ask_output_path("Archivo para guardar K (base64): ", path, sizeof(path))) {
+            if (write_b64_file(path, s->K, AES_KEY_BYTES, 0600))
+                printf("Llave K guardada en base64: %s\n", path);
+        }
+    }
+}
+
+/* Sección 2.2: Cifrar archivo con K y AES directo */
+static void action_encrypt_file(session_t *s)
+{
+    char in[PATH_BUF_SIZE], out[PATH_BUF_SIZE];
+    unsigned char K[AES_KEY_BYTES];
+
+    if (!get_session_or_input_key(s, K))
+        return;
+
+    if (!ask_input_path("Archivo a cifrar            : ", in, sizeof(in))
+        || !ask_output_path("Archivo cifrado de salida   : ", out, sizeof(out)))
+        return;
+    if (strcmp(in, out) == 0) {
+        fprintf(stderr, "La entrada y la salida deben ser archivos distintos\n");
+        return;
+    }
+
+    if (aes_encrypt_file(in, out, K)) {
+        printf("Archivo cifrado guardado en: %s\n", out);
+        memcpy(s->K, K, AES_KEY_BYTES);
+        s->have_K = 1;
+    } else {
+        fprintf(stderr, "No se pudo cifrar el archivo\n");
+    }
+    OPENSSL_cleanse(K, sizeof(K));
+}
+
+/* Sección 2.3: Cifrar K con la llave pública RSA-OAEP */
+static void action_wrap_key(session_t *s)
+{
+    char pubp[PATH_BUF_SIZE], out[PATH_BUF_SIZE];
+    EVP_PKEY *pub;
+    unsigned char *ct = NULL;
+    size_t ctlen = 0;
+    unsigned char K[AES_KEY_BYTES];
+
+    if (!get_session_or_input_key(s, K))
+        return;
+
+    if (!ask_input_path("Archivo de la llave pública : ", pubp, sizeof(pubp)))
+        return;
+    pub = load_public_key(pubp);
+    if (pub == NULL)
+        return;
+    if (!ask_output_path("Archivo para guardar K cifrada: ", out, sizeof(out))) {
+        EVP_PKEY_free(pub);
+        return;
+    }
+    if (wrap_key(pub, K, AES_KEY_BYTES, &ct, &ctlen)
+        && write_b64_file(out, ct, ctlen, 0644)) {
+        printf("K cifrada con RSA-OAEP (%zu bytes) guardada en base64: %s\n",
+               ctlen, out);
+    }
+    free(ct);
+    EVP_PKEY_free(pub);
+    OPENSSL_cleanse(K, sizeof(K));
+}
+
+/* Sección 2.4: Descifrar K con la llave privada RSA-OAEP con CRT */
+static void action_unwrap_key(session_t *s)
+{
+    char privp[PATH_BUF_SIZE], inp[PATH_BUF_SIZE];
+    EVP_PKEY *priv;
+    unsigned char *ct = NULL;
+    size_t ctlen = 0;
+    unsigned char K[AES_KEY_BYTES];
+
+    if (!ask_input_path("Archivo de la llave privada : ", privp, sizeof(privp))
+        || !ask_input_path("Archivo con K cifrada (base64): ", inp, sizeof(inp)))
+        return;
+    priv = load_private_key(privp);
+    if (priv == NULL)
+        return;
+    if (!read_b64_file(inp, KEYFILE_MAX_SIZE, &ct, &ctlen)) {
+        EVP_PKEY_free(priv);
+        return;
+    }
+    if (unwrap_key(priv, ct, ctlen, K)) {
+        print_key_b64("K descifrada con RSA-OAEP (CRT)", K);
+        memcpy(s->K, K, sizeof(K));
+        s->have_K = 1;
+        printf("-> Llave K guardada en la sesión actual para descifrar archivos.\n");
+    }
+    free(ct);
+    EVP_PKEY_free(priv);
+    OPENSSL_cleanse(K, sizeof(K));
+}
+
+/* Sección 2.5: Descifrar archivo con AES directo */
+static void action_decrypt_file(session_t *s)
+{
+    char in[PATH_BUF_SIZE], out[PATH_BUF_SIZE];
+    unsigned char K[AES_KEY_BYTES];
+
+    if (!get_session_or_input_key(s, K))
+        return;
+
+    if (!ask_input_path("Archivo cifrado             : ", in, sizeof(in))
+        || !ask_output_path("Archivo descifrado de salida: ", out, sizeof(out)))
+        return;
+    if (strcmp(in, out) == 0) {
+        fprintf(stderr, "La entrada y la salida deben ser archivos distintos\n");
+        return;
+    }
+
+    if (aes_decrypt_file(in, out, K)) {
+        printf("Archivo descifrado guardado en: %s\n", out);
+        memcpy(s->K, K, AES_KEY_BYTES);
+        s->have_K = 1;
+    } else {
+        fprintf(stderr, "No se pudo descifrar el archivo\n");
+    }
+    OPENSSL_cleanse(K, sizeof(K));
+}
+
+static void print_menu(void)
+{
+    printf("\n=== Práctica 6: RSA-OAEP (CRT, PKCS #7) + AES Directo (sin modo de operación) ===\n");
+    printf(" 1) Generar par de llaves RSA-OAEP (CRT, formato PKCS #7 / Base64)\n");
+    printf(" 2) Generar llave aleatoria K de 128 bits para AES (Base64)\n");
+    printf(" 3) Cifrar un archivo con AES directo (bloques con relleno PKCS #7)\n");
+    printf(" 4) Cifrar llave K con la llave pública RSA-OAEP (guardar en Base64)\n");
+    printf(" 5) Descifrar llave K con la llave privada RSA-OAEP (CRT, Base64)\n");
+    printf(" 6) Descifrar un archivo con AES directo (usando K)\n");
+    printf(" 0) Salir\n");
+}
+
+int main(void)
+{
+    session_t s;
+    char line[32];
+    int rc;
+
+    memset(&s, 0, sizeof(s));
+    for (;;) {
+        print_menu();
+        rc = read_line("Opción: ", line, sizeof(line));
+        if (rc < 0)
+            break;
+        if (rc == 0)
+            continue;
+        switch (line[0]) {
+        case '1': action_keygen();           break;
+        case '2': action_generate_aes_key(&s); break;
+        case '3': action_encrypt_file(&s);   break;
+        case '4': action_wrap_key(&s);       break;
+        case '5': action_unwrap_key(&s);     break;
+        case '6': action_decrypt_file(&s);   break;
+        case '0': OPENSSL_cleanse(&s, sizeof(s)); return 0;
+        default:  fprintf(stderr, "Opción no válida\n");
+        }
+    }
+    OPENSSL_cleanse(&s, sizeof(s));
+    return 0;
+}
