@@ -21,6 +21,9 @@
 #define CMAC_INT_ERR        4   // Error en mac init
 #define CMAC_UPD_ERR        5   // Error en mac update
 #define CMAC_FIN_ERR        6   // Error en mac final
+#define CMAC_KEY_ERR        7   // Error al generar la llave
+#define CMAC_LEN_ERR        8   // Error en el tamaño de la llave
+
 
 int cmac_keygen();
 int cmac_compute(const unsigned char* key, size_t key_len, const unsigned char* data, size_t data_len, unsigned char* out, size_t *out_len);
