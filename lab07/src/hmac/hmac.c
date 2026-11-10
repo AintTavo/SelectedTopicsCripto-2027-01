@@ -59,7 +59,16 @@ int hmac_compute(
 int hmac_verify( 
     const unsigned char* key, size_t key_len, 
     const unsigned char* data, size_t data_len, 
-    const unsigned char* out, size_t *out_len
+    const unsigned char* out, size_t out_len
 ) {
+    unsigned char* tmp_out;
+    size_t tmp_out_len = 0;
+
+    int out_hmac = hmac_compute(key, key_len, data, data_len, tmp_out, &tmp_out_len);
+    if ( out_hmac != HMAC_OK ) return out_hmac; 
+
+    if ( out_len != tmp_out_len ) return HMAC_ERR;
+
+    if ( !CRYPTO_memcmp(out, tmp_out, out_len) ) return HMAC_ERR;
     return HMAC_OK;
 }
