@@ -1,7 +1,9 @@
 #include "kmac.h"
 
-
-int kmac_keygen(){
+int kmac_keygen(unsigned char* key, const unsigned int mode, size_t key_len){
+    int min_len = ( mode == KMAC_MOD_128 ) ? 16 : 32;
+    if (key_len < min_len) return KMAC_LEN_ERR;
+    if ( RAND_priv_bytes(key, key_len) != 1 ) return KMAC_KEY_ERR; 
     return KMAC_OK;
 }
 
@@ -9,6 +11,7 @@ int kmac_compute(
     const unsigned char* key, size_t key_len, 
     const unsigned char* data, size_t data_len, 
     const char *custom_str,
+    const unsigned int mode,
     unsigned char* out, size_t out_len
 ){
     EVP_MAC *mac = NULL;
@@ -17,7 +20,16 @@ int kmac_compute(
     int idx = 0;
 
     // Asignación de implmentación de MAC
-    mac = EVP_MAC_fetch(NULL, "KMAC-128", NULL);
+    switch (mode) {
+        case KMAC_MOD_128 : 
+            mac = EVP_MAC_fetch(NULL, "KMAC-128", NULL);
+            break;
+        case KMAC_MOD_256 : 
+            mac = EVP_MAC_fetch(NULL, "KMAC-256", NULL);
+            break;
+        default: return KMAC_ALG_ERR;
+    }
+    
     if (!mac) {
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
@@ -64,11 +76,12 @@ int kmac_verify(
     const unsigned char* key, size_t key_len,
     const unsigned char* data, size_t data_len,
     const char *custom_str,
+    const unsigned int mode,
     const unsigned char* out, size_t out_len
 ) {
     unsigned char* tmp_out;
-
-    int out_kmac = kmac_verify(key, key_len, data, data_len, custom_str, tmp_out, out_len);
+    
+    int out_kmac = kmac_compute(key, key_len, data, data_len, custom_str, mode, tmp_out, out_len);
     if ( out_kmac != KMAC_OK ) return out_kmac;
     
     if ( !CRYPTO_memcmp(out, tmp_out, out_len) ) return KMAC_ERR;
