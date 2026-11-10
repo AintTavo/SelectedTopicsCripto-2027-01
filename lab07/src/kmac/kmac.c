@@ -1,6 +1,9 @@
 #include "kmac.h"
 
 
+int kmac_keygen(){
+    return KMAC_OK;
+}
 
 int kmac_compute(
     const unsigned char* key, size_t key_len, 
@@ -56,3 +59,7 @@ int kmac_compute(
     EVP_MAC_free(mac);
     return KMAC_OK;
 };
+
+int kmac_verify() {
+    return KMAC_OK;
+}

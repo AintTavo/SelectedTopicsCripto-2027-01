@@ -22,6 +22,8 @@
 #define HMAC_UPD_ERR       5   // Error en mac update
 #define HMAC_FIN_ERR       6   // Error en mac final
 
+int hmac_keygen();
 int hmac_compute(const unsigned char* key, size_t key_len, const unsigned char* data, size_t data_len, unsigned char* out, size_t *out_len);
+int hmac_verify(const unsigned char* key, size_t key_len, const unsigned char* data, size_t data_len, const unsigned char* out, size_t *out_len);
 
 #endif

@@ -1,5 +1,9 @@
 #include "hmac.h"
 
+int hmac_keygen() {
+    return HMAC_OK;
+}
+
 int hmac_compute(
     const unsigned char* key, 
     size_t key_len, 
@@ -51,3 +55,11 @@ int hmac_compute(
     EVP_MAC_free(mac);
     return HMAC_OK;
 };
+
+int hmac_verify( 
+    const unsigned char* key, size_t key_len, 
+    const unsigned char* data, size_t data_len, 
+    const unsigned char* out, size_t *out_len
+) {
+    return HMAC_OK;
+}

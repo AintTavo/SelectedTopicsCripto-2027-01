@@ -22,6 +22,8 @@
 #define KMAC_UPD_ERR       5   // Error en mac update
 #define KMAC_FIN_ERR       6   // Error en mac final
 
+int kmac_keygen();
 int kmac_compute(const unsigned char* key, size_t key_len, const unsigned char* data, size_t data_len, const char *custom_str, unsigned char* out, size_t out_len);
+int kmac_verify();
 
 #endif
