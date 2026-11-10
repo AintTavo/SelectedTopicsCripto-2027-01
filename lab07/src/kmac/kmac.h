@@ -24,6 +24,6 @@
 
 int kmac_keygen();
 int kmac_compute(const unsigned char* key, size_t key_len, const unsigned char* data, size_t data_len, const char *custom_str, unsigned char* out, size_t out_len);
-int kmac_verify();
+int kmac_verify(const unsigned char* key, size_t key_len, const unsigned char* data, size_t data_len, const char *custom_str, const unsigned char* out, size_t out_len);
 
 #endif

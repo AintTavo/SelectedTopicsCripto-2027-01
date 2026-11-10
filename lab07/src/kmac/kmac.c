@@ -60,6 +60,17 @@ int kmac_compute(
     return KMAC_OK;
 };
 
-int kmac_verify() {
+int kmac_verify(
+    const unsigned char* key, size_t key_len,
+    const unsigned char* data, size_t data_len,
+    const char *custom_str,
+    const unsigned char* out, size_t out_len
+) {
+    unsigned char* tmp_out;
+
+    int out_kmac = kmac_verify(key, key_len, data, data_len, custom_str, tmp_out, out_len);
+    if ( out_kmac != KMAC_OK ) return out_kmac;
+    
+    if ( !CRYPTO_memcmp(out, tmp_out, out_len) ) return KMAC_ERR;
     return KMAC_OK;
 }
