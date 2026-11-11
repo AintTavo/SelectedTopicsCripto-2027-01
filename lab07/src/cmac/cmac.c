@@ -1,12 +1,30 @@
 #include "cmac.h"
+#include <openssl/rand.h>
 
-int cmac_keygen() {
+int cmac_keygen(unsigned char* key, const unsigned mode) {
+    int key_len = 0;
+    switch (mode) {
+        case CMAC_MOD_AES128 :
+            key_len = 16;
+            break;
+        case CMAC_MOD_AES192 :
+            key_len = 24;
+            break;
+        case CMAC_MOD_AES256 :
+            key_len = 32;
+            break;
+        default : return CMAC_MOD_ERR;
+    }
+
+    if ( RAND_priv_bytes(key, key_len) != 1 ) return CMAC_KEY_ERR;
+
     return CMAC_OK;
 }
 
 int cmac_compute(
     const unsigned char* key, size_t key_len,
-    const unsigned char* data, size_t data_len, 
+    const unsigned char* data, size_t data_len,
+    const unsigned int mode,
     unsigned char* out, size_t *out_len
 ){
     EVP_MAC *mac = NULL;
@@ -18,20 +36,45 @@ int cmac_compute(
     if (!mac) {
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
-        return CMAC_ALG_ERR;    // Error al adjuntar el algoritmo HMAC
+        return CMAC_ALG_ERR;    // Error al adjuntar el algoritmo CMAC
     }
-    
+
     // Crear el contexto
     ctx = EVP_MAC_CTX_new(mac);
     if (!ctx) {
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
         return CMAC_CTX_ERR;  // Error al asignar el contexto
-    } 
+    }
 
-    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, (char*)"AES-128-CBC", 0);
+    int abs_len_key = 0;
+    switch (mode) {
+        case CMAC_MOD_AES128 :
+            params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, (char*)"AES-128-CBC", 0);
+            abs_len_key = 16;
+            break;
+        case CMAC_MOD_AES192 :
+            params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, (char*)"AES-192-CBC", 0);
+            abs_len_key = 24;
+            break;
+        case CMAC_MOD_AES256 :
+            params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, (char*)"AES-256-CBC", 0);
+            abs_len_key = 32;
+            break;
+        default :
+            EVP_MAC_CTX_free(ctx);
+            EVP_MAC_free(mac);
+            return CMAC_MOD_ERR; // Error al asignar el modo de AES correcto
+    }
+
     params[1] = OSSL_PARAM_construct_end();
-    
+
+    if ( key_len != abs_len_key ) {
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        return CMAC_KEY_ERR;
+    }
+
     if ( !EVP_MAC_init(ctx, key, key_len, params) ) {
         EVP_MAC_CTX_free(ctx);
         EVP_MAC_free(mac);
@@ -54,18 +97,19 @@ int cmac_compute(
 };
 
 int cmac_verify(
-    const unsigned char* key, size_t key_len, 
-    const unsigned char* data, size_t data_len, 
+    const unsigned char* key, size_t key_len,
+    const unsigned char* data, size_t data_len,
+    const unsigned int mode,
     const unsigned char* out, size_t out_len
 ) {
     unsigned char* tmp_out;
     size_t tmp_out_len = 0;
 
-    int out_cmac = cmac_compute(key, key_len, data, data_len, tmp_out, &tmp_out_len);
+    int out_cmac = cmac_compute(key, key_len, data, data_len, mode, tmp_out, &tmp_out_len);
     if (out_cmac != CMAC_OK) return out_cmac;
 
     if ( out_len != tmp_out_len ) return CMAC_ERR;
-    
+
     if ( !CRYPTO_memcmp(out, tmp_out, out_len) ) return CMAC_ERR;
     return CMAC_OK;
 }
